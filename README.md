@@ -4,8 +4,9 @@ This repository studies how two approaches to memory management, Go's garbage
 collector and Rust's ownership model, behave when they run the same server
 workload on the same hardware.
 
-> **Status:** the automated design review is complete and human review is
-> pending; there are no results yet. The next step is checkpoint C1, which
+> **Status:** the automated design review is complete, except for the GC stage
+> analysis added afterwards, and human review is pending; there are no results
+> yet. The next step is checkpoint C1, which
 > verifies the facts the design depends on. Results will appear in `posts/`
 > once they exist.
 
@@ -115,9 +116,9 @@ For the Go variants, the same runs also record each garbage collection cycle
 stage by stage: when the cycle started, how long its marking phase took, and
 how much of that marking was done by background workers and how much by
 request goroutines as mark assists. This makes it possible to show which stage
-of the cycle each Go rung changes, for example that raising `GOGC` makes
-cycles less frequent while the slab layout makes each one shorter, and to
-relate that to the latency results. A small separate set of diagnostic runs
+of the cycle each Go rung changes, for example whether raising `GOGC` makes
+cycles less frequent and the slab layout makes each one shorter, as the
+design predicts, and to relate that to the latency results. A small separate set of diagnostic runs
 adds detailed runtime traces, which are too expensive to collect during the
 main measurements. The stages and the signals used are described in
 [`docs/research/gc-phases.md`](docs/research/gc-phases.md).

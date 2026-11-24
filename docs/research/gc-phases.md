@@ -196,7 +196,8 @@ details matter for the experiment:
   is also counted in `/gc/cycles/automatic`, not in `/gc/cycles/forced`
   ("forced by the application"). It has to be inferred, for example as a cycle
   whose start is about 120 s after the previous cycle and whose starting heap is
-  well below that cycle's trigger.
+  below the lowest possible trigger (the previous marked heap plus 45/64 of the
+  way to the goal, Section 1.5), which gctrace=1 alone can compute.
 * During a periodic cycle the idle mark workers are limited (Section 1.2), so
   its wall-clock mark time can be longer than a heap-triggered cycle with the
   same scan work.

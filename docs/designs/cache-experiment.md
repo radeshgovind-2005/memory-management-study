@@ -1,7 +1,9 @@
 # The Cache Experiment: Measuring What Rust Changes in Memory Management Compared With Modern Go
 
 *   **Author:** Radesh Govind
-*   **Status:** In Review (EGM Goldfish review complete; awaiting human review)
+*   **Status:** In Review (EGM Goldfish review complete for decisions D1–D12;
+    Goal 9 and decision D13, added afterwards, not yet reviewed; awaiting
+    human review)
 *   **Date:** 2026-11-23 (revised 2026-11-24 after design review)
 
 --------------------------------------------------------------------------------
@@ -427,9 +429,12 @@ C11.
     logs at startup; no extra GC poller is needed. `GODEBUG=scavtrace=1`
     adds one line per cycle about memory returned to the operating system.
     Nothing in gctrace or `runtime/metrics` labels the roughly 2-minute forced
-    cycle as forced, so it is inferred from timing (a gap of about 120 seconds
-    since the previous cycle with the heap below its trigger); the rule and
-    the count per run are published. Client and server series
+    cycle as forced, so it is inferred from fields gctrace=1 prints: a cycle
+    is periodic when it starts at least 115 seconds after the previous cycle
+    and its heap at cycle start is below the lowest possible heap trigger,
+    that is, the previous cycle's marked heap plus 45/64 of the way from
+    there to this cycle's goal; the rule and the count per run are
+    published. Client and server series
     are aligned using the NTP offsets of the SUT and load nodes, recorded in
     the manifest. Request-path instrumentation is identical within each
     language and follows the same stamping rule in both (FAIRNESS).
@@ -1607,8 +1612,9 @@ layout at startup. Variants `go-default` and `go-tuned` use `pointer`;
 26. **`experiments/cache/go/internal/prefill/prefill.go`** and
     **`prefill_test.go`**. *Contents:* the contract's generator; the test checks
     `golden.json`. *Why:* identical data across languages.
-27. **`experiments/cache/go/internal/server/server.go`** and
-    **`server_test.go`** (hot path). *Contents:* the wrapped listener and
+27. **`experiments/cache/go/internal/server/server.go`**,
+    **`server_test.go`** (hot path) and **`diag_trace.go`** (built only with
+    the `diag` tag). *Contents:* the wrapped listener and
     connection, the handlers, body handling and stamping from the contract;
     tests cover routing, status codes, stamping and fill exclusion. *Why:*
     contract and latency measurement.
@@ -1623,8 +1629,8 @@ layout at startup. Variants `go-default` and `go-tuned` use `pointer`;
     for 60 seconds each: allocation-heavy, contended mutex, and allocate-and-
     discard. *Why:* checks that the sampler's categories attribute correctly
     in Go.
-30. **`experiments/cache/go/Dockerfile`**, **`Dockerfile.profiling`** and
-    **`.golangci.yml`**. *Contents:* multi-stage build with the pinned Go image,
+30. **`experiments/cache/go/Dockerfile`**, **`Dockerfile.profiling`**,
+    **`Dockerfile.diag`** and **`.golangci.yml`**. *Contents:* multi-stage build with the pinned Go image,
     `CGO_ENABLED=0`, `-trimpath`, onto `gcr.io/distroless/static`; the
     profiling variant adds `-tags ddprof`; a `Dockerfile.diag` variant adds
     `-tags diag`, which enables the flight recorder and a `trace.WithRegion`
@@ -1888,7 +1894,10 @@ startup. Variant `rust-pointer` uses `pointer`; `rust-index` uses `slab`.
     cAdvisor root cgroup `id="/"`, missed scrapes, restarts, throttling,
     `map_growth_since_prefill` = 0, hit ratio against the `SPEC.md` target,
     `/gc/limiter/last-enabled` unchanged during the window for the tuned Go
-    variants, and `/sched/pauses/total/other` near zero);
+    variants at the 25% and 70% levels (at the 110% level a limiter
+    engagement is recorded in the overload outcome instead of invalidating
+    the run), and `/sched/pauses/total/other` under the threshold frozen in
+    `METRICS.md` at C2);
     writes the verdict and overload outcome into the manifest; the
     block-level check belongs to `campaign.py`. Tests cover each check. *Why:*
     invalid runs are kept but never charted.
