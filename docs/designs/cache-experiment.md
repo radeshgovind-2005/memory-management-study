@@ -147,6 +147,14 @@ remaining gap is published whatever its size.
     used to diagnose and illustrate the results in one dedicated profiling
     campaign, with Datadog profiler overhead measured once per language and
     published.
+9.  **Explain the Go side stage by stage.** For each Go rung, show which stage
+    of the garbage collection cycle it changes (how often cycles run, how much
+    marking each cycle does, how much of that marking falls on requests as
+    mark assists) and how that explains its latency, CPU and memory results.
+    The expected direction for each rung and stage is frozen in
+    `PREDICTIONS.md` at C2, and the charts are described in "GC stage
+    analysis" below. Rust has no collection cycle, so the language comparison
+    itself uses only shared totals; the stage charts explain Go's totals.
 
 ## Non-Goals
 
@@ -189,7 +197,7 @@ criterion is met.
 | C6 | Reproduce the mechanism locally | Alignment measure computed and reported for local `go-default` runs; if there is no alignment, the cause is documented and a go/no-go decision recorded; latency target frozen | local run folders, alignment chart |
 | C7 | Core cloud campaigns | Starts with the smoke test (one variant per language, no comparison; rules v1 freeze). Ends when the minimum publishable campaign is committed and the remaining campaigns have run in Budget order until credit runs out; the post lists which ran | `TUNING.md`, run folders |
 | C8 | Calculated density | Density table computed from main-sweep measurements | `derived.json`, table |
-| C9 | Datadog profiling | Profiling campaign done; screenshots and overhead recorded | `posts/img/` |
+| C9 | Datadog profiling and GC diagnostics | Profiling campaign and GC diagnostic campaign done; screenshots, traces and tracer overhead recorded | `posts/img/`, diagnostic run folders |
 | C10 | Methodology post | Published | `posts/methodology.md` |
 | C11 | Cache post | Published with every external claim sourced | `posts/big-cache.md` |
 
@@ -216,11 +224,14 @@ C11.
     tuning was tried. Answered at C1 and recorded in `claims.yaml`.
 *   **Forced GC in current Go**: Does the roughly 2-minute forced GC still exist
     in the pinned Go version, and when does it fire? Answered at C1.
-*   **Which Go collector**: Does the pinned Go version use the newer "Green
-    Tea" collector (which marks memory span by span) by default? Answered at
-    C1. `PREDICTIONS.md` states which collector the predictions assume; if
-    Green Tea is the default, the post says so and the mechanism story is
-    re-checked at C6.
+*   **Which Go collector**: Answered by research (see
+    [`docs/research/gc-phases.md`](../research/gc-phases.md)): the "Green Tea"
+    collector, which scans small objects span by span, is the default since
+    Go 1.26. It changes how marking scans but not the phase structure, the
+    pacer, the stop-the-world points or mark assists. Still open, answered at
+    C1: the pinned Go version, and whether Green Tea can be switched off in it
+    **(needs verification)**. `PREDICTIONS.md` states that the predictions
+    assume Green Tea.
 *   **Map growth behaviour**: How do the pinned Go and Rust versions grow a
     map (all at once or incrementally)? The design pre-sizes every map, so
     this affects only the explanation **(needs verification)**.
@@ -413,7 +424,12 @@ C11.
     overhead. GC
     cycle times come from `GODEBUG=gctrace=1` (each line carries its offset
     from process start) plus the wall-clock process start time the variant
-    logs at startup; no extra GC poller is needed. Client and server series
+    logs at startup; no extra GC poller is needed. `GODEBUG=scavtrace=1`
+    adds one line per cycle about memory returned to the operating system.
+    Nothing in gctrace or `runtime/metrics` labels the roughly 2-minute forced
+    cycle as forced, so it is inferred from timing (a gap of about 120 seconds
+    since the previous cycle with the heap below its trigger); the rule and
+    the count per run are published. Client and server series
     are aligned using the NTP offsets of the SUT and load nodes, recorded in
     the manifest. Request-path instrumentation is identical within each
     language and follows the same stamping rule in both (FAIRNESS).
@@ -424,11 +440,22 @@ C11.
     the run folder. CPU is split into categories by a reviewed, frozen frame
     list in METRICS.md, with a one-line reason per
     frame and the same counting rule for both languages:
-    *   **Memory management, Go:** marking (`runtime.gcBgMarkWorker`,
-        `runtime.gcAssist*`), sweeping (`runtime.bgsweep`, `runtime.sweepone`,
-        `mspan.sweep`), write barriers (`runtime.gcWriteBarrier*`,
-        `wbBufFlush`), scavenging (`bgscavenge`), allocation
-        (`runtime.mallocgc`), and their children.
+    *   **Memory management, Go:** reported in sub-categories that add up to
+        the frozen total: STW (`runtime.gcStart`,
+        `runtime.stopTheWorldWithSema`, `runtime.gcMarkTermination`,
+        `runtime.gcMarkDone`), mark background (`runtime.gcBgMarkWorker` and
+        `runtime.gcDrain*`), mark assists (`runtime.gcAssistAlloc*`,
+        `runtime.gcParkAssist`), scanning including the Green Tea span
+        scanner (`runtime.scanSpan`, `scan.ScanSpanPacked*`), write barriers
+        (`runtime.gcWriteBarrier*`, `runtime.wbBufFlush*`), sweeping
+        (`runtime.bgsweep`, `runtime.sweepone`,
+        `runtime.(*sweepLocked).sweep`), scavenging (`runtime.bgscavenge`,
+        `runtime.(*pageAlloc).scavenge*`) and allocation (matched by the
+        prefix `runtime.mallocgc`, because Go 1.27 calls size-specialised
+        allocators such as `runtime.mallocgcSmallScanNoHeaderSC…` directly),
+        each with their children. Frame names are checked against the pinned
+        version by the smoke test; the full list is in
+        [`docs/research/gc-phases.md`](../research/gc-phases.md).
     *   **Memory management, Rust:** mimalloc (`mi_*`) and the deallocation
         part of `drop_in_place` frames (user drop logic excluded).
     *   **Lock wait, both:** Go `sync.(*Mutex).lockSlow`, `semacquire`,
@@ -441,7 +468,10 @@ C11.
     Rust is built with `RUSTFLAGS=-C force-frame-pointers=yes` and mimalloc with
     `-fno-omit-frame-pointer` (through `CFLAGS`); because the precompiled Rust
     standard library has no frame pointers, Rust is sampled with `perf
-    --call-graph dwarf`. Smoke checks in each language confirm that a
+    --call-graph dwarf`. `perf` records with `-k CLOCK_MONOTONIC`, and each
+    variant logs one paired monotonic and wall-clock reading at startup, so
+    every sample can be tagged as inside a mark phase, inside a sweep window
+    or outside GC by joining it with the gctrace intervals. Smoke checks in each language confirm that a
     synthetic allocation loop, a contended-mutex loop and a drop-heavy loop
     each attribute more than 90% of samples to the expected category. Each run
     reports its share of truncated stacks, and page-fault counts (kernel-side
@@ -586,10 +616,16 @@ more cores is a stated limitation and a Future Improvement.
 
 ### Runtime metrics exposed by each variant
 
-*   **Go:** `runtime/metrics` values exported on `/metrics`: GC CPU seconds,
-    GC pause histogram, GC cycle count, heap live bytes, heap goal, mark-assist
-    CPU if available in the pinned version **(needs verification)**; gctrace
-    lines and the wall-clock process start time (component 7).
+*   **Go:** `runtime/metrics` values exported on `/metrics`: the GC CPU
+    classes split into assist (`/cpu/classes/gc/mark/assist:cpu-seconds`),
+    dedicated, idle and pause, plus scavenge CPU; `/gc/scan/*`;
+    `/gc/heap/goal` and `/gc/heap/live`; `/gc/cycles/*`;
+    `/gc/limiter/last-enabled`; `/sched/pauses/{total,stopping}/{gc,other}`;
+    `/sched/latencies`; `/gc/heap/allocs:bytes`; `/memory/classes/heap/*`.
+    The CPU-class values update only at a GC stop-the-world, so they step once
+    per cycle and are used per cycle or per run, never per second. Also
+    gctrace and scavtrace lines and the wall-clock process start time
+    (component 7).
 *   **Rust:** process RSS, mimalloc process info (current and peak committed
     memory) **(needs verification of what the crate exposes)**, live bytes
     tracked by the cache, request counts.
@@ -699,14 +735,16 @@ from the provider's price list.
 | Sampler overhead (1 variant per language × on/off × 3) | 12 | 3 |
 | Cross-node check (1 level × 5 variants × 3 blocks × 2 nodes) | 30 | 9 |
 | Datadog profiling (5 variants, plus overhead once per language) | 9 | 3 |
+| GC diagnostic campaign (6 Go + 3 overhead + 4 Rust runs) | 13 | 5 |
 | Calibration (2) and sizing pre-runs | — | 6 |
-| **Total** | **about 237** | **about 71** |
+| **Total** | **about 250** | **about 76** |
 
 **Minimum publishable campaign:** both tuning sweeps, the load-level sweep,
 the entry-count sweep and the sampler-overhead runs, plus calibration and
 sizing (about 59 cluster-hours). This covers Goals 1–3, including the
-entry-count chart that explains the mechanism. The cross-node check and
-Datadog profiling (C9) follow while credit remains. Each campaign file
+entry-count chart that explains the mechanism; the GC stage charts come from
+these same runs. The cross-node check, Datadog profiling and the GC diagnostic
+campaign (C9) follow while credit remains. Each campaign file
 repeats its own estimate, and `session-up` refuses to start a campaign whose
 estimate exceeds the configured remaining credit.
 
@@ -722,6 +760,66 @@ estimate exceeds the configured remaining credit.
     a follow-on (decision D7).
 *   **Image size.** Compressed image size from the registry, reported per
     language (start-up time appears once, as a footnote).
+
+### GC stage analysis (Go only)
+
+A Go GC cycle has five observable stages: a short stop-the-world at the start,
+a concurrent mark phase (background workers, idle-time workers and mark
+assists, with the write barrier on), a short stop-the-world at mark
+termination, a concurrent sweep, and the background scavenger that returns
+memory to the operating system. The pacer decides when the next cycle starts.
+With `GOMAXPROCS=2`, the runtime starts no dedicated mark worker: its 25%
+background target (half a vCPU) is met by a fractional worker and by idle
+workers, so mark assists carry relatively more of the work than on larger
+machines. Details, sources and the signals for each stage are in
+[`docs/research/gc-phases.md`](../research/gc-phases.md).
+
+Each rung is expected to change a different stage. Raising `GOGC` should make
+cycles less frequent without shortening each mark, so latency spikes should
+become rarer but not smaller. `GOMEMLIMIT` should cap the heap goal and make
+cycles more frequent as memory nears the limit. The slab layout should remove
+most of the scan work inside each mark, along with most write-barrier work and
+per-entry allocation, so marks become short and assist-light while cycles
+continue. These expectations, with the metric that should move for each, are
+frozen in `PREDICTIONS.md` at C2.
+
+`harness/analysis/gc_phases.py` turns gctrace, scavtrace, `runtime/metrics`,
+latency histograms and timestamped `perf` samples into these charts, all from
+the existing measurement runs:
+
+| Chart | What it shows |
+| --- | --- |
+| Per-cycle phase timeline | STW, mark and sweep windows on a time axis for one representative window per rung, with per-second server p99.9 above and spike seconds marked |
+| Cycle anatomy | Median mark wall time, assist, background and idle CPU, and STW per cycle, as one stacked bar per rung |
+| Cycles per minute | Per rung, split into heap-triggered and inferred periodic cycles |
+| Mark CPU vs scannable heap | Per cycle, across the entry-count sweep, coloured by layout |
+| Assist pressure | Assist CPU divided by mark wall time per cycle, next to p99.9 inside and outside mark |
+| Heap-goal sawtooth | Heap at cycle start and end, live heap, goal, `GOMEMLIMIT`, pod limit and working set over time |
+| Latency inside vs outside mark | Distributions of per-second p99.9, per rung |
+| GC CPU by stage | `perf` CPU per Go sub-category, inside vs outside mark, aggregated over all cycles in a run |
+| Rust companion | Working set over time and memory-management CPU per 1,000 requests, on the same axes as Go |
+
+The charts are descriptive: they explain the comparisons in component 10 and
+add no new decision rules. Across languages, only shared totals and the
+spike-second rate are compared, because only Go has a cycle to align with.
+
+**GC diagnostic campaign (decision D13).** About 13 runs, in the C9 session
+alongside Datadog profiling, using separate images built with a `diag` tag
+whose numbers never enter the headline comparisons:
+
+*   **Go, 3 rungs × 5M entries × 70% × 2 blocks (6 runs):** `GODEBUG=gctrace=2`
+    and `gcpacertrace=1`, and `runtime/trace` captured with the flight
+    recorder over windows that include at least one heap-triggered and one
+    periodic cycle, with a `trace.WithRegion` around each request. These give
+    assist time per request (latency distributions for requests with and
+    without an assist), objects scanned per cycle, and minimum-mutator-
+    utilisation curves per rung.
+*   **Tracer overhead (3 runs):** `go-default` with the diagnostic tracing off,
+    compared with the runs above, so the tracer's cost on this workload is
+    published.
+*   **Rust, 2 layouts × 2 blocks (4 runs):** `perf` with an `madvise`
+    tracepoint count and mimalloc process information, to show when mimalloc
+    returns memory next to the working set.
 
 ### Architecture decisions
 
@@ -814,6 +912,14 @@ estimate exceeds the configured remaining credit.
     vCPUs) and those settings are reused everywhere. Giving go-pointerfree its
     own sweep means the headline compares Rust with Go's best layout and best
     settings; accepted cost about 4 cluster-hours.
+*   **D13. GC stage analysis: decided, analysis of measurement-run data plus a
+    small diagnostic campaign** (author). Stage-level charts are built from the
+    gctrace, `runtime/metrics` and `perf` data the measurement runs already
+    collect, with rung-by-stage predictions frozen at C2. Detailed tracing
+    (`gctrace=2`, `gcpacertrace=1`, `runtime/trace`) runs only in a separate
+    13-run diagnostic campaign at C9, with its overhead measured and
+    published. Accepted cost: about 5 cluster-hours, one analysis module, and
+    results that hold for one Go version at 2 vCPUs.
 
 ## Alternatives Considered
 
@@ -990,6 +1096,16 @@ estimate exceeds the configured remaining credit.
 *   **Reason for Rejection**: Rejected by author in favour of best p99.9 with
     ties broken by memory-management CPU.
 
+### Alternative U: No stage analysis, or full tracing in every measurement run (D13)
+
+*   **Pros**: No stage analysis keeps the plan smallest; tracing every run
+    would give per-request assist data everywhere.
+*   **Cons**: Without stage analysis, the post can report how much each rung
+    changes but not why; tracing in measurement runs adds overhead to the
+    numbers being compared.
+*   **Reason for Rejection**: Rejected by author in favour of stage analysis
+    from existing data plus a separate diagnostic campaign.
+
 ## Risks and Mitigations
 
 | Risk | Type | Mitigation | Where enforced |
@@ -1005,6 +1121,10 @@ estimate exceeds the configured remaining credit.
 | Bugs in AI-generated code, or `unsafe` Rust corrupting memory under load | failure | Conformance suite in CI; allocation-count tests; Miri for `lru_pointer.rs`; Go race detector; AI mistakes logged | C4, D5 |
 | `go-default` does not fit the node at 10M entries | failure | C1 fit check; sweep capped at 5M if it does not fit, and the post says so | Open Questions |
 | Calibration overstates a variant's capacity | validity | Fine steps longer than a forced-GC interval, judged on worst 10 seconds; cross-check of every variant | Run protocol |
+| GC internals differ between Go versions (gctrace format, Green Tea, frame names, worker split at other `GOMAXPROCS`) | validity | Go version pinned and recorded; the gctrace parser fails on an unknown format; prefix-based frame rules checked by the smoke test; stage results stated as holding for one Go version at 2 vCPUs | D13, component 8 |
+| Diagnostic tracing changes the timing it observes | validity | Tracing only in the diagnostic campaign; tracer overhead measured and published | D13 |
+| Periodic GC cycles misclassified | validity | Inference rule and per-run counts published; traces in the diagnostic campaign confirm a sample | component 7 |
+| Go-only stage charts read as a one-sided comparison | validity | Languages compared only on shared totals and the spike-second rate; stage charts presented as explanation of Go's totals | Goal 9 |
 | Public raw files incur egress cost | cost | Only large raw files are public; small results are in git; billing alert covers egress | Results store, NFR: Cost control |
 
 ## Non-Functional Requirements
@@ -1081,7 +1201,10 @@ estimate exceeds the configured remaining credit.
 *   **The proxy experiment**, after the cache post is published, once its
     framing is settled (see Open Questions).
 *   **An older Go version** run on the same workload, to show how much Go itself
-    improved since the Discord post.
+    improved since the Discord post, including a collector comparison with
+    Green Tea switched off if the pinned version still allows it.
+*   **Stage analysis at other `GOMAXPROCS` values**, where Go does start
+    dedicated mark workers, and per-stage tuning experiments.
 *   **The labelled memory-limit demo**: shrink the limit live and show each
     variant's behaviour.
 
@@ -1241,7 +1364,8 @@ Rust `hdrhistogram`, Python `hdrh`.
     post.
 2.  **`Makefile`**. *Contents:*
     *   `build`: Go, Rust, campaign, sampler and node-facts images.
-    *   `build-profiling`: the two Datadog profiling images.
+    *   `build-profiling`: the two Datadog profiling images and the Go `diag`
+        image used by the GC diagnostic campaign.
     *   `test`, `conformance VARIANT=…`, `conformance-stub`, `persistent-up`,
         `analyze`, `charts`: commands run inline.
     *   `local-run VARIANT=… ENTRIES=… LEVEL=…`: calls `local-run.sh`.
@@ -1384,7 +1508,10 @@ Rust `hdrhistogram`, Python `hdrh`.
 11. **`docs/PREDICTIONS.md`** (frozen at C2). *Contents:* for each layout pair,
     load level and entry count, the expected direction, size bucket (under
     10%, 10–50%, over 50%) and mechanism. Prediction columns are never edited;
-    only an Outcome column is appended after C7. *Why:* records the expected
+    only an Outcome column is appended after C7. Includes the rung-by-stage
+    table from [`docs/research/gc-phases.md`](../research/gc-phases.md)
+    (change, stage affected, mechanism, metric, expected direction), stating
+    that it assumes the Green Tea collector. *Why:* records the expected
     mechanisms before any result, so they can be checked against outcomes.
 12. **`docs/AI_LOG.md`** and **`docs/prompts/<lang>-<component>.md`**.
     *Contents:* dated mistakes found in AI-generated code and how they were
@@ -1487,7 +1614,9 @@ layout at startup. Variants `go-default` and `go-tuned` use `pointer`;
     contract and latency measurement.
 28. **`experiments/cache/go/internal/metrics/`** (`metrics.go`,
     `histograms.go`, `histograms_test.go`). *Contents:* the `runtime/metrics`
-    names listed in `METRICS.md`, cache stats including per-shard lock
+    names listed in `METRICS.md` (including the GC CPU classes, scan, heap,
+    cycle, limiter, pause and scheduling-latency metrics), a startup log line
+    with paired monotonic and wall-clock readings, cache stats including per-shard lock
     acquisitions, and the histogram scheme from the contract; tests cover
     rotation, encoding and the 1,200-slot cap. *Why:* METRICS.md sources.
 29. **`experiments/cache/go/cmd/smoke/main.go`**. *Contents:* three loops run
@@ -1497,7 +1626,9 @@ layout at startup. Variants `go-default` and `go-tuned` use `pointer`;
 30. **`experiments/cache/go/Dockerfile`**, **`Dockerfile.profiling`** and
     **`.golangci.yml`**. *Contents:* multi-stage build with the pinned Go image,
     `CGO_ENABLED=0`, `-trimpath`, onto `gcr.io/distroless/static`; the
-    profiling variant adds `-tags ddprof`; linters `govet`, `staticcheck`,
+    profiling variant adds `-tags ddprof`; a `Dockerfile.diag` variant adds
+    `-tags diag`, which enables the flight recorder and a `trace.WithRegion`
+    per request through `internal/server/diag_trace.go`; linters `govet`, `staticcheck`,
     `errcheck`, `ineffassign`, `unused`. *Why:* same multi-stage distroless
     pattern as Rust; CI.
 
@@ -1610,7 +1741,8 @@ startup. Variant `rust-pointer` uses `pointer`; `rust-index` uses `slab`.
 48. **`experiments/cache/campaigns/`**: `smoke.yaml`, `calibration.yaml`,
     `tuning-go-tuned.yaml`, `tuning-go-pointerfree.yaml`, `load-level.yaml`,
     `entry-count.yaml`, `sampler-overhead.yaml`, `cross-node.yaml`,
-    `datadog-profiling.yaml`, and **`harness/schema/campaign.schema.json`**.
+    `datadog-profiling.yaml`, `gc-diagnostics.yaml`, and
+    **`harness/schema/campaign.schema.json`**.
     *Contents:* campaign ID, schedule seed, configurations with levels as
     percentages of capacity, the calibrated absolute rates (committed after
     calibration by `make collect`), block counts, sessions of at most 12
@@ -1662,14 +1794,16 @@ startup. Variant `rust-pointer` uses `pointer`; `rust-index` uses `slab`.
 54. **`harness/k8s/sut.yaml.tmpl`**. *Contents:* Deployment and Service for one
     variant in namespace `bench`; node selector and toleration for `sut`;
     Guaranteed QoS sized from the sizing table; image by digest; env from the
-    variant file; readiness probe on `/readyz`; `GODEBUG=gctrace=1` for Go.
+    variant file; readiness probe on `/readyz`; `GODEBUG=gctrace=1,scavtrace=1`
+    for Go (plus `gctrace=2,gcpacertrace=1` in diagnostic runs).
     *Why:* the system under test.
 55. **`harness/k8s/sampler-daemonset.yaml`**. *Contents:* privileged
     DaemonSet in `bench` on the `sut` pool with `hostPID`; an init container
     that writes `madvise` to the THP `enabled` and `defrag` files; started and
     stopped by `run.sh` through `kubectl exec`; finds the cache PID by its
-    cgroup path; records with `perf record -F 99 -g` for Go and `perf record
-    -F 99 --call-graph dwarf` for Rust; after stopping, and before the cache
+    cgroup path; records with `perf record -k CLOCK_MONOTONIC -F 99 -g` for Go
+    and `perf record -k CLOCK_MONOTONIC -F 99 --call-graph dwarf` for Rust (in
+    Rust diagnostic runs, also counting the `madvise` syscall tracepoint); after stopping, and before the cache
     pod is deleted, runs `perf script` on the node (where the binaries are
     reachable through `/proc/<pid>/root`) and writes the text next to
     `perf.data`. *Why:* D6.
@@ -1752,7 +1886,9 @@ startup. Variant `rust-pointer` uses `pointer`; `rust-index` uses `slab`.
 67. **`harness/scripts/validate.sh`** and **`scripts/tests/validate.bats`**.
     *Contents:* per-run checks (dropped iterations, k6 node CPU from the
     cAdvisor root cgroup `id="/"`, missed scrapes, restarts, throttling,
-    `map_growth_since_prefill` = 0, hit ratio against the `SPEC.md` target);
+    `map_growth_since_prefill` = 0, hit ratio against the `SPEC.md` target,
+    `/gc/limiter/last-enabled` unchanged during the window for the tuned Go
+    variants, and `/sched/pauses/total/other` near zero);
     writes the verdict and overload outcome into the manifest; the
     block-level check belongs to `campaign.py`. Tests cover each check. *Why:*
     invalid runs are kept but never charted.
@@ -1793,20 +1929,30 @@ startup. Variant `rust-pointer` uses `pointer`; `rust-index` uses `slab`.
     `summary.json` only: latency by load level, latency by entry count, CPU
     share, bytes per entry, calculated pods per node, and overload outcomes.
     *Why:* charts are reproducible.
-74. **`harness/analysis/tests/`**: `test_analyze.py` (a mixed-environment and a
+74. **`harness/analysis/gc_phases.py`**. *Contents:* parses gctrace and
+    scavtrace into a per-cycle table (start, the three clock durations,
+    assist, background and idle CPU, heap at start, end and live, goal,
+    stacks, globals, inferred trigger kind), failing on an unknown gctrace
+    format; joins it with per-second histograms, Prometheus exports and
+    timestamped `perf` samples; produces the charts in "GC stage analysis";
+    reads the diagnostic campaign's traces for assist time per request and
+    objects scanned per cycle. *Why:* Goal 9 and D13.
+75. **`harness/analysis/tests/`**: `test_analyze.py` (a mixed-environment and a
     mixed-version case that must fail), `test_cpu_share.py` (a
     frame-attribution case per language), `test_gc_align.py` (a synthetic run
-    with known alignment). *Why:* analysis bugs would corrupt every result.
+    with known alignment), `test_gc_phases.py` (fixed gctrace lines from the
+    pinned Go version, an unknown-format line that must fail, and the
+    periodic-cycle inference). *Why:* analysis bugs would corrupt every result.
 
 #### Results and posts (C6–C11)
 
-75. **`results/README.md`**. *Contents:* folder layout, where large files live,
+76. **`results/README.md`**. *Contents:* folder layout, where large files live,
     how to rerun a run from its manifest. *Why:* CUJ 2.
-76. **`results/cache/<env>/<run>/`** (created by runs) and
+77. **`results/cache/<env>/<run>/`** (created by runs) and
     **`results/cache/<env>/summary.json`** (created by `analyze.py`).
     *Contents:* `manifest.yaml`, `histograms/`, `profiles/`, `metrics/`,
     `logs/`, `derived.json`; the campaign summary. *Why:* source of truth.
-77. **`posts/methodology.md`** (C10), **`posts/big-cache.md`** (C11) and
+78. **`posts/methodology.md`** (C10), **`posts/big-cache.md`** (C11) and
     **`posts/img/`** (authored output). *Contents:* the posts, Datadog
     screenshots as static images, a predictions-versus-outcomes table, and a
     "where the gap is smaller than the story claimed" section. *Why:* the
@@ -1819,7 +1965,7 @@ startup. Variant `rust-pointer` uses `pointer`; `rust-index` uses `slab`.
     campaign, sampler and node-facts images; `make build-profiling` the two
     profiling images.
 *   **Unit tests:** `go test -race ./...`; `cargo test`; the pinned-nightly
-    Miri command from item 41; `pytest` in `harness/analysis`,
+    Miri command from the Rust tests item; `pytest` in `harness/analysis`,
     `harness/campaign` and `experiments/cache/sim`; `bats
     harness/scripts/tests`; golden-vector tests in Go, Rust, Python and k6;
     every row of the allocation table in both languages.

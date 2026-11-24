@@ -111,6 +111,17 @@ version, so that any published number can be traced back to the runs that
 produced it. Large raw files, such as `perf` profiles, are kept in a
 public-read results bucket instead of git, and the run folder points to them.
 
+For the Go variants, the same runs also record each garbage collection cycle
+stage by stage: when the cycle started, how long its marking phase took, and
+how much of that marking was done by background workers and how much by
+request goroutines as mark assists. This makes it possible to show which stage
+of the cycle each Go rung changes, for example that raising `GOGC` makes
+cycles less frequent while the slab layout makes each one shorter, and to
+relate that to the latency results. A small separate set of diagnostic runs
+adds detailed runtime traces, which are too expensive to collect during the
+main measurements. The stages and the signals used are described in
+[`docs/research/gc-phases.md`](docs/research/gc-phases.md).
+
 ## Keeping the comparison fair
 
 A benchmark like this can produce a gap between the languages that has nothing
@@ -186,6 +197,9 @@ experiment.
   alternatives considered, risks and implementation plan.
 - [System diagram](docs/designs/system_design.excalidraw), which can be viewed
   at [excalidraw.com](https://excalidraw.com).
+- [GC stages research note](docs/research/gc-phases.md): the Go garbage
+  collection cycle stage by stage, how each stage is observed, and what each
+  Go rung is expected to change.
 - [Design reviews](docs/reviews/): the findings from each review stage and how
   each one was resolved.
 
